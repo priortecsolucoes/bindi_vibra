@@ -4,9 +4,8 @@ Seletores confirmados via inspeção real do DOM (login SSO Keycloak +
 aplicação Angular Material), exceto onde indicado o contrário.
 """
 
-import os
 from dataclasses import dataclass
-from typing import List
+from typing import Callable, List, Optional
 
 from selenium import webdriver
 from selenium.common.exceptions import TimeoutException
@@ -18,7 +17,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 ORDERS_URL = "https://cn.vibraenergia.com.br/consultar-pedidos/#/meus-pedidos"
 
 DEFAULT_TIMEOUT = 30
-MFA_CODE_FILE = "mfa_code.txt"
+MFA_POLL_SECONDS = 5
 
 ORDER_NUMBER_SELECTOR = "td.mat-column-numeroPedido span.numero-pedido-selecionado"
 PRODUCT_ROWS_SELECTOR = "app-lista-produtos table.tabela-lista-produtos tbody tr"
@@ -50,11 +49,13 @@ def login(
     username: str,
     password: str,
     mfa_wait_seconds: int,
+    fetch_mfa_code: Callable[[], Optional[str]],
     timeout: int = DEFAULT_TIMEOUT,
 ) -> None:
     """Abre 'Meus pedidos' (redireciona pro SSO), autentica e espera a lista carregar.
-    Se o SSO pedir o código de 2FA (enviado por e-mail), aguarda até
-    mfa_wait_seconds para o usuário digitá-lo manualmente na janela do Chrome."""
+    Se o SSO pedir o código de 2FA (enviado por e-mail), consulta fetch_mfa_code
+    (token informado na tela de Unidades do Portal Bindi Log) por até
+    mfa_wait_seconds e digita o código assim que ele aparecer."""
     print("[INFO] Acessando o Canal de Negócios Vibra...")
     driver.get(ORDERS_URL)
 
@@ -83,38 +84,41 @@ def login(
         WebDriverWait(driver, timeout).until(
             lambda d: d.find_elements(By.CSS_SELECTOR, ORDER_NUMBER_SELECTOR) or _is_mfa_screen(d)
         )
-        if _is_mfa_screen(driver):
-            print(
-                f"[AVISO] Autenticação em 2 fatores: digite na janela do Chrome o código enviado por "
-                f"e-mail (ou grave-o em {MFA_CODE_FILE}). Aguardando até {mfa_wait_seconds}s..."
-            )
-            try:
-                WebDriverWait(driver, mfa_wait_seconds, poll_frequency=2).until(
-                    lambda d: _try_mfa_code_file(d) or d.find_elements(By.CSS_SELECTOR, ORDER_NUMBER_SELECTOR)
-                )
-            except TimeoutException as exc:
-                raise RuntimeError(
-                    f"Código de 2FA não informado (ou inválido) em {mfa_wait_seconds}s."
-                ) from exc
     except TimeoutException as exc:
         raise RuntimeError(
             "Login não confirmado: a lista 'Meus pedidos' não carregou. "
             f"Verifique usuário/senha. URL atual: {driver.current_url}"
         ) from exc
 
+    if _is_mfa_screen(driver):
+        print(
+            "[AVISO] Autenticação em 2 fatores: informe o código recebido por e-mail no campo "
+            f"'Token Login Dist.' da unidade, na tela de Unidades do portal. Aguardando até {mfa_wait_seconds}s..."
+        )
+        typed_codes: List[str] = []
+        try:
+            WebDriverWait(driver, mfa_wait_seconds, poll_frequency=MFA_POLL_SECONDS).until(
+                lambda d: _try_mfa_code(d, fetch_mfa_code, typed_codes)
+                or d.find_elements(By.CSS_SELECTOR, ORDER_NUMBER_SELECTOR)
+            )
+        except TimeoutException as exc:
+            detail = "código informado não foi aceito" if typed_codes else "código não informado no portal"
+            raise RuntimeError(f"Autenticação em 2 fatores não concluída em {mfa_wait_seconds}s ({detail}).") from exc
+
     print("[OK] Login realizado com sucesso.")
 
 
-def _try_mfa_code_file(driver: webdriver.Chrome) -> bool:
-    """Alternativa a digitar na janela: se MFA_CODE_FILE existir, digita o
-    código dele na tela de 2FA e apaga o arquivo. Sempre devolve False
-    (quem encerra a espera é a lista de pedidos carregando)."""
-    if not os.path.isfile(MFA_CODE_FILE):
+def _try_mfa_code(driver: webdriver.Chrome, fetch_mfa_code: Callable[[], Optional[str]], typed_codes: List[str]) -> bool:
+    """Digita na tela de 2FA um código novo vindo do portal. Sempre devolve
+    False - quem encerra a espera é a lista de pedidos carregando."""
+    if not _is_mfa_screen(driver):
         return False
-    with open(MFA_CODE_FILE, encoding="utf-8") as file:
-        code = file.read().strip()
-    os.remove(MFA_CODE_FILE)
-    if not code or not _is_mfa_screen(driver):
+    try:
+        code = fetch_mfa_code()
+    except Exception as exc:  # noqa: BLE001 - falha momentânea do portal não pode abortar a espera
+        print(f"[AVISO] Falha ao consultar o token no portal (tentando de novo): {exc}")
+        return False
+    if not code or code in typed_codes:
         return False
 
     # Seletor do campo de código não confirmado via DOM - usa o primeiro input visível da tela.
@@ -127,7 +131,8 @@ def _try_mfa_code_file(driver: webdriver.Chrome) -> bool:
         return False
     inputs[0].clear()
     inputs[0].send_keys(code, Keys.ENTER)
-    print(f"[INFO] Código de 2FA lido de {MFA_CODE_FILE} e enviado.")
+    typed_codes.append(code)
+    print("[INFO] Token informado no portal digitado na tela de 2FA.")
     return False
 
 

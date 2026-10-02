@@ -1,8 +1,10 @@
-"""PROCESS — login no Canal de Negócios Vibra, abre cada pedido pendente na
-lista 'Meus pedidos', compara cada item do Portal Bindi Log com o produto
-correspondente na Vibra (autorizado total/parcial ou bloqueado) e reporta a
-situação ao portal. Erro em um pedido não interrompe os demais."""
+"""PROCESS — para cada unidade com itens pendentes: login no Canal de Negócios
+Vibra com o usuário/senha da unidade (código 2FA lido do portal), abre cada
+pedido pendente na lista 'Meus pedidos', compara cada item do Portal Bindi Log
+com o produto correspondente na Vibra (autorizado total/parcial ou bloqueado)
+e reporta a situação ao portal. Erro numa unidade ou num pedido não interrompe os demais."""
 
+import os
 from typing import Dict, List, Optional
 
 from Automation.VibraPortal import (
@@ -16,9 +18,9 @@ from Automation.VibraPortal import (
 from Framework.InitModule import BotConfig
 from Log.LogModule import LogModule
 from Utils.DriverFactory import create_driver, load_cookies, save_cookies
-from Utils.PortalClient import report_item_situations
+from Utils.PortalClient import clear_station_token, fetch_station_login, report_item_situations
 
-COOKIES_PATH = "vibra_cookies.json"
+COOKIES_PATH_TEMPLATE = "vibra_cookies_{station_id}.json"
 QTY_EPSILON_LITERS = 1.0
 
 SITUATION_TOTAL = "AUTORIZADO TOTAL"
@@ -34,13 +36,48 @@ def process_items(pending_items: List[dict], config: BotConfig, log_module: LogM
         print("[INFO] Nenhum item pendente no Portal Bindi Log - não abrindo o navegador.")
         return
 
-    items_by_order: Dict[str, List[dict]] = {}
+    # Cada unidade tem seu próprio login na Vibra, e 'Meus pedidos' só mostra
+    # os pedidos daquele login.
+    items_by_station: Dict[int, List[dict]] = {}
     for item in pending_items:
+        items_by_station.setdefault(item["stationId"], []).append(item)
+
+    situations_to_report: List[dict] = []
+    for station_id, station_items in items_by_station.items():
+        print("=" * 55)
+        station_label = station_items[0].get("stationName") or f"id {station_id}"
+        print(f"[INFO] Unidade {station_label}: {len(station_items)} item(ns) pendente(s).")
+        try:
+            situations_to_report.extend(_process_station(station_id, station_items, config, log_module))
+        except Exception as exc:  # noqa: BLE001 - erro numa unidade não pode parar as demais
+            print(f"[ERRO] Falha ao processar a unidade {station_label}: {exc}")
+
+    _report_situations(situations_to_report, config)
+
+
+def _process_station(station_id: int, station_items: List[dict], config: BotConfig, log_module: LogModule) -> List[dict]:
+    station_login = fetch_station_login(config.portal_api_url, config.portal_api_token, station_id)
+    if not station_login.get("username") or not station_login.get("password"):
+        raise RuntimeError(
+            "usuário/senha de login na Vibra não cadastrados - preencha 'Usuário Login Dist.' e "
+            "'Senha Login Dist.' na tela de Unidades do portal."
+        )
+    # Código antigo (já usado ou expirado) não pode ser digitado no login novo.
+    clear_station_token(config.portal_api_url, config.portal_api_token, station_id)
+
+    def fetch_mfa_code() -> Optional[str]:
+        return fetch_station_login(config.portal_api_url, config.portal_api_token, station_id).get("token")
+
+    items_by_order: Dict[str, List[dict]] = {}
+    for item in station_items:
         items_by_order.setdefault(item["distributorOrderNumber"], []).append(item)
 
+    # Perfil e cookies separados por unidade: a sessão do SSO de um login não
+    # pode ser reaproveitada por outra unidade.
+    cookies_path = COOKIES_PATH_TEMPLATE.format(station_id=station_id)
     driver = create_driver(
         headless=config.headless,
-        user_data_dir=config.chrome_user_data_dir,
+        user_data_dir=os.path.join(config.chrome_user_data_dir, f"station_{station_id}"),
         profile_directory=config.chrome_profile_directory,
         user_agent=config.chrome_user_agent,
         window_size=config.chrome_window_size,
@@ -48,18 +85,18 @@ def process_items(pending_items: List[dict], config: BotConfig, log_module: LogM
     )
 
     logged_in = False
-    situations_to_report: List[dict] = []
+    to_report: List[dict] = []
     try:
-        load_cookies(driver, COOKIES_PATH)
-        login(driver, config.username, config.password, config.mfa_wait_seconds)
+        load_cookies(driver, cookies_path)
+        login(driver, station_login["username"], station_login["password"], config.mfa_wait_seconds, fetch_mfa_code)
         logged_in = True
-        save_cookies(driver, COOKIES_PATH)
+        save_cookies(driver, cookies_path)
 
         listed_orders = list_order_numbers(driver)
         print(f"[OK] {len(listed_orders)} pedido(s) encontrado(s) em 'Meus pedidos'.")
 
         for order_number, portal_items in items_by_order.items():
-            print("=" * 55)
+            print("-" * 55)
             if order_number not in listed_orders:
                 print(f"[AVISO] Pedido {order_number} não está na lista 'Meus pedidos' da Vibra.")
                 continue
@@ -67,21 +104,21 @@ def process_items(pending_items: List[dict], config: BotConfig, log_module: LogM
                 print(f"[INFO] Abrindo pedido {order_number}...")
                 open_order_detail(driver, order_number)
                 vibra_items = extract_order_items(driver, order_number)
-                situations_to_report.extend(_compare_order(portal_items, vibra_items, log_module))
+                to_report.extend(_compare_order(portal_items, vibra_items, log_module))
             except Exception as exc:  # noqa: BLE001 - erro por pedido não pode parar o loop
                 print(f"[ERRO] Falha ao processar o pedido {order_number}: {exc}")
             finally:
                 back_to_orders_list(driver)
-
-        _report_situations(situations_to_report, config)
     finally:
         # Só com login confirmado: cookies de uma tentativa falha sobrescreveriam uma sessão boa.
         if logged_in:
-            save_cookies(driver, COOKIES_PATH)
+            save_cookies(driver, cookies_path)
         try:
             driver.quit()
         except Exception as exc:  # noqa: BLE001 - falha ao encerrar não pode mascarar um erro anterior
-            print(f"[AVISO] Falha ao encerrar o Chrome ao final da execução (ignorado): {exc}")
+            print(f"[AVISO] Falha ao encerrar o Chrome (ignorado): {exc}")
+
+    return to_report
 
 
 def _compare_order(portal_items: List[dict], vibra_items: List[OrderItem], log_module: LogModule) -> List[dict]:

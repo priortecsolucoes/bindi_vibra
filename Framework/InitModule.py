@@ -13,8 +13,6 @@ from Utils.DriverFactory import resolve_chrome_binary
 
 @dataclass
 class BotConfig:
-    username: str
-    password: str
     headless: bool
     chrome_binary_path: Optional[str]
     chrome_user_data_dir: Optional[str]
@@ -31,15 +29,6 @@ class BotConfig:
 def initialize() -> BotConfig:
     """Carrega o .env e valida os pré-requisitos mínimos para a execução."""
     load_dotenv()
-
-    username = os.environ.get("VIBRA_USUARIO")
-    password = os.environ.get("VIBRA_SENHA")
-
-    if not username or not password:
-        raise RPAFrameworkException(
-            "Defina as variáveis de ambiente VIBRA_USUARIO e VIBRA_SENHA no .env "
-            "antes de executar este bot."
-        )
 
     orders_path = os.environ.get("PEDIDOS_PATH", "").strip() or None
     if orders_path and not os.path.isfile(orders_path):
@@ -86,8 +75,6 @@ def initialize() -> BotConfig:
     print("[OK] Ambiente validado (.env, credenciais e pré-requisitos).")
 
     return BotConfig(
-        username=username,
-        password=password,
         headless=headless,
         chrome_binary_path=chrome_binary_path,
         chrome_user_data_dir=chrome_user_data_dir,
