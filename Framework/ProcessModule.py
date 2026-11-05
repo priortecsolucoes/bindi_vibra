@@ -1,5 +1,5 @@
 """PROCESS — para cada unidade com itens pendentes: login no Canal de Negócios
-Vibra com o usuário/senha da unidade (código 2FA lido do portal), abre cada
+Vibra com o usuário/senha da unidade (código 2FA lido do e-mail ou do portal), abre cada
 pedido pendente na lista 'Meus pedidos', compara cada item do Portal Bindi Log
 com o produto correspondente na Vibra (autorizado total/parcial ou bloqueado)
 e reporta a situação ao portal. Erro numa unidade ou num pedido não interrompe os demais."""
@@ -11,9 +11,13 @@ from Automation.VibraPortal import (
     OrderItem,
     back_to_orders_list,
     extract_order_items,
+    go_home,
     list_order_numbers,
     login,
     open_order_detail,
+    open_orders_list,
+    read_current_company,
+    switch_to_next_company,
 )
 from Framework.InitModule import BotConfig
 from Log.LogModule import LogModule
@@ -57,11 +61,16 @@ def process_items(pending_items: List[dict], config: BotConfig, log_module: LogM
 
 def _process_station(station_id: int, station_items: List[dict], config: BotConfig, log_module: LogModule) -> List[dict]:
     station_login = fetch_station_login(config.portal_api_url, config.portal_api_token, station_id)
-    if not station_login.get("username") or not station_login.get("password"):
-        raise RuntimeError(
-            "usuário/senha de login na Vibra não cadastrados - preencha 'Usuário Login Dist.' e "
-            "'Senha Login Dist.' na tela de Unidades do portal."
-        )
+    username = station_login.get("username")
+    password = station_login.get("password")
+    if not username or not password:
+        if not config.default_username or not config.default_password:
+            raise RuntimeError(
+                "usuário/senha de login na Vibra não cadastrados - preencha 'Usuário Login Dist.' e "
+                "'Senha Login Dist.' na tela de Unidades do portal, ou VIBRA_USUARIO/VIBRA_SENHA no .env."
+            )
+        print("[INFO] Unidade sem login cadastrado no portal - usando VIBRA_USUARIO/VIBRA_SENHA do .env.")
+        username, password = config.default_username, config.default_password
     # Código antigo (já usado ou expirado) não pode ser digitado no login novo.
     clear_station_token(config.portal_api_url, config.portal_api_token, station_id)
 
@@ -88,27 +97,49 @@ def _process_station(station_id: int, station_items: List[dict], config: BotConf
     to_report: List[dict] = []
     try:
         load_cookies(driver, cookies_path)
-        login(driver, station_login["username"], station_login["password"], config.mfa_wait_seconds, fetch_mfa_code)
+        login(
+            driver,
+            username,
+            password,
+            config.mfa_wait_seconds,
+            fetch_mfa_code,
+            token_api_url=config.token_api_url,
+            token_api_token=config.token_api_token,
+            token_timeout_seconds=config.token_timeout_seconds,
+        )
         logged_in = True
         save_cookies(driver, cookies_path)
+        open_orders_list(driver)
 
-        listed_orders = list_order_numbers(driver)
-        print(f"[OK] {len(listed_orders)} pedido(s) encontrado(s) em 'Meus pedidos'.")
-
-        for order_number, portal_items in items_by_order.items():
+        # Um login enxerga vários postos do grupo, mas a lista só mostra os
+        # pedidos do posto ativo: pedido não achado fica pendente para o próximo posto.
+        pending_orders = dict(items_by_order)
+        visited_companies = [read_current_company(driver)]
+        while True:
+            company = visited_companies[-1]
             print("-" * 55)
-            if order_number not in listed_orders:
-                print(f"[AVISO] Pedido {order_number} não está na lista 'Meus pedidos' da Vibra.")
-                continue
+            print(f"[INFO] Empresa ativa na Vibra: {company}")
+            _process_listed_orders(driver, company, pending_orders, to_report, log_module)
+            if not pending_orders:
+                break
+
+            print(f"[INFO] {len(pending_orders)} pedido(s) não encontrado(s) em {company} - procurando em outra empresa do grupo.")
             try:
-                print(f"[INFO] Abrindo pedido {order_number}...")
-                open_order_detail(driver, order_number)
-                vibra_items = extract_order_items(driver, order_number)
-                to_report.extend(_compare_order(portal_items, vibra_items, log_module))
-            except Exception as exc:  # noqa: BLE001 - erro por pedido não pode parar o loop
-                print(f"[ERRO] Falha ao processar o pedido {order_number}: {exc}")
-            finally:
-                back_to_orders_list(driver)
+                go_home(driver)
+                next_company = switch_to_next_company(driver, visited_companies)
+                if next_company is None:
+                    break
+                visited_companies.append(next_company)
+                open_orders_list(driver)
+            except Exception as exc:  # noqa: BLE001 - falha na troca não pode descartar o que já foi coletado
+                print(f"[ERRO] Falha ao trocar de empresa do grupo (busca encerrada nesta unidade): {exc}")
+                break
+
+        for order_number in pending_orders:
+            print(
+                f"[AVISO] Pedido {order_number} não está na lista 'Meus pedidos' de nenhuma empresa do grupo "
+                f"({', '.join(visited_companies)})."
+            )
     finally:
         # Só com login confirmado: cookies de uma tentativa falha sobrescreveriam uma sessão boa.
         if logged_in:
@@ -119,6 +150,29 @@ def _process_station(station_id: int, station_items: List[dict], config: BotConf
             print(f"[AVISO] Falha ao encerrar o Chrome (ignorado): {exc}")
 
     return to_report
+
+
+def _process_listed_orders(
+    driver, company: str, pending_orders: Dict[str, List[dict]], to_report: List[dict], log_module: LogModule
+) -> None:
+    """Processa os pedidos pendentes que aparecem na lista da empresa ativa e os
+    tira de pending_orders - mesmo com erro no detalhe, para não procurá-los de novo em outra empresa."""
+    listed_orders = list_order_numbers(driver)
+    found = [order for order in pending_orders if order in listed_orders]
+    print(f"[OK] {len(listed_orders)} pedido(s) na lista; {len(found)} pendente(s) encontrado(s) em {company}.")
+
+    for order_number in found:
+        portal_items = pending_orders.pop(order_number)
+        print("-" * 55)
+        try:
+            print(f"[INFO] Abrindo pedido {order_number}...")
+            open_order_detail(driver, order_number)
+            vibra_items = extract_order_items(driver, order_number)
+            to_report.extend(_compare_order(portal_items, vibra_items, log_module))
+        except Exception as exc:  # noqa: BLE001 - erro por pedido não pode parar o loop
+            print(f"[ERRO] Falha ao processar o pedido {order_number}: {exc}")
+        finally:
+            back_to_orders_list(driver)
 
 
 def _compare_order(portal_items: List[dict], vibra_items: List[OrderItem], log_module: LogModule) -> List[dict]:
