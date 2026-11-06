@@ -26,5 +26,7 @@ COPY . .
 # Sem display no container - headless é obrigatório aqui (diferente do
 # padrão local em .env.example, que é 0 pra acompanhar a execução).
 ENV CHROME_HEADLESS=1
+# O agendamento é o cron do Railway (railway.json): cada execução roda uma vez e encerra.
+ENV SCHEDULE_INTERVAL_MINUTES=0
 
 CMD ["python", "main.py"]
