@@ -163,6 +163,7 @@ Railway, via `Dockerfile` (Python 3.11-slim + Google Chrome) + `railway.json`
 dashboard do Railway (nunca no Dockerfile): `PORTAL_API_URL`, `PORTAL_API_TOKEN`,
 `VIBRA_TOKEN_API_URL`, `VIBRA_TOKEN_API_TOKEN` (o login na
 Vibra vem do cadastro de Unidades). `CHROME_HEADLESS=1` e `SCHEDULE_INTERVAL_MINUTES=0`
-já vêm fixos no Dockerfile. Fora do container, `main.py` repete a execução a cada
+já vêm fixos no Dockerfile (a Akamai da Vibra dá "Access Denied" para `HeadlessChrome` no
+User-Agent; o `DriverFactory` troca por `Chrome` em headless). Fora do container, `main.py` repete a execução a cada
 `SCHEDULE_INTERVAL_MINUTES` (padrão 5; 0 = roda uma vez). No container o perfil/cookies não persistem entre execuções (sem
 volume), então cada execução pede um código 2FA novo por unidade.

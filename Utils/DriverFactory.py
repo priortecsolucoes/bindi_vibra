@@ -53,12 +53,45 @@ def resolve_chrome_binary(explicit_path: Optional[str]) -> Optional[str]:
     return explicit_path
 
 
+_headless_user_agent: Optional[str] = None
+
+
+def _resolve_headless_user_agent(chrome_binary_path: Optional[str]) -> str:
+    """User-Agent real do Chrome instalado com 'HeadlessChrome' trocado por 'Chrome'.
+    A Akamai da Vibra responde 'Access Denied' só por causa dessa marca no headless
+    (confirmado). Lido de um Chrome descartável, sem perfil, para acompanhar a
+    versão instalada; o resto do User-Agent e os Client Hints já batem com ela.
+    Uma vez por processo - o driver é recriado por unidade e a cada ciclo."""
+    global _headless_user_agent
+    if _headless_user_agent:
+        return _headless_user_agent
+
+    probe_options = webdriver.ChromeOptions()
+    probe_options.add_argument("--headless=new")
+    probe_options.add_argument("--no-sandbox")
+    probe_options.add_argument("--disable-dev-shm-usage")
+    if chrome_binary_path:
+        probe_options.binary_location = chrome_binary_path
+    probe = webdriver.Chrome(options=probe_options)
+    try:
+        real_user_agent = probe.execute_script("return navigator.userAgent")
+    finally:
+        probe.quit()
+
+    _headless_user_agent = real_user_agent.replace("HeadlessChrome", "Chrome")
+    return _headless_user_agent
+
+
 def _diagnose_chrome_binary(chrome_binary_path: Optional[str]) -> None:
     """Roda o binário do Chrome direto, fora do Selenium, só pra log - o
     ChromeDriver só repassa 'Chrome instance exited' genérico quando o
     processo morre na inicialização, sem o stderr real do Chrome. Chamado só
     no caminho headless (container), onde esse erro apareceu; não deve travar
     a execução se o próprio diagnóstico falhar."""
+    # 'google-chrome' só existe no container Linux; no Windows o chrome.exe nem imprime --version.
+    if os.name == "nt":
+        return
+
     binary = chrome_binary_path or "google-chrome"
     for args in (
         ["--version"],
@@ -99,8 +132,9 @@ def create_driver(
     Parameters
     ----------
     headless : bool
-        Mantenha False enquanto o bloqueio da Akamai estiver ativo — headless
-        é mais facilmente detectado.
+        Em headless o User-Agent leva 'HeadlessChrome' e a Akamai bloqueia;
+        sem `user_agent` explícito, ele é trocado pelo do Chrome normal
+        (ver _resolve_headless_user_agent).
     user_data_dir, profile_directory : str, opcional
         Perfil real do Chrome (cookies `_abck`/`bm_sz` já validados pela
         Akamai nesse IP). É a mitigação mais eficaz contra o bloqueio; o
@@ -145,6 +179,15 @@ def create_driver(
 
     if chrome_binary_path:
         options.binary_location = chrome_binary_path
+
+    if not user_agent and headless:
+        try:
+            user_agent = _resolve_headless_user_agent(chrome_binary_path)
+        except Exception as exc:
+            raise RPAFrameworkException(
+                "Não foi possível ler o User-Agent do Chrome para o modo headless "
+                f"(sem ele a Vibra responde 'Access Denied'): {exc}"
+            ) from exc
 
     if user_agent:
         options.add_argument(f"--user-agent={user_agent}")
