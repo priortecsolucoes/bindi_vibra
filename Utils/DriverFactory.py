@@ -108,6 +108,42 @@ def _diagnose_chrome_binary(chrome_binary_path: Optional[str]) -> None:
             print(f"[AVISO] Falha ao rodar diagnóstico do Chrome ({args}): {exc}")
 
 
+def _close_orphan_chrome(user_data_dir: str) -> None:
+    """Encerra Chromes que ficaram abertos com este perfil (execução anterior
+    interrompida à força, sem driver.quit). O Chrome não abre dois processos
+    no mesmo perfil: o novo morre na hora com 'DevToolsActivePort file doesn't
+    exist'. Só no Windows - no container cada execução começa sem processos."""
+    if os.name != "nt":
+        return
+
+    # Casa o caminho exato do perfil (station_2 não pode pegar station_25).
+    script = (
+        "$pattern = [regex]::Escape($env:BOT_PROFILE_DIR) + '(\"|\\s|$)'; "
+        "$procs = Get-CimInstance Win32_Process -Filter \"name='chrome.exe'\" | "
+        "Where-Object { $_.CommandLine -match $pattern }; "
+        "$procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "@($procs).Count"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, "BOT_PROFILE_DIR": os.path.abspath(user_data_dir)},
+        )
+    except Exception as exc:  # noqa: BLE001 - se falhar, o erro real aparece ao abrir o Chrome
+        print(f"[AVISO] Não foi possível verificar Chromes abertos com o perfil {user_data_dir}: {exc}")
+        return
+
+    killed = result.stdout.strip()
+    if result.returncode != 0:
+        print(f"[AVISO] Falha ao verificar Chromes abertos com o perfil {user_data_dir}: {result.stderr.strip()[:300]}")
+    elif killed.isdigit() and int(killed) > 0:
+        print(f"[AVISO] {killed} processo(s) do Chrome de uma execução anterior ainda usavam o perfil "
+              f"{user_data_dir} - encerrados.")
+
+
 def create_driver(
     headless: bool = False,
     user_data_dir: Optional[str] = None,
@@ -193,6 +229,7 @@ def create_driver(
         options.add_argument(f"--user-agent={user_agent}")
 
     if user_data_dir:
+        _close_orphan_chrome(user_data_dir)
         options.add_argument(f"--user-data-dir={user_data_dir}")
         if profile_directory:
             options.add_argument(f"--profile-directory={profile_directory}")

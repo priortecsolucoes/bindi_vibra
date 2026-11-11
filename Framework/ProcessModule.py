@@ -12,6 +12,7 @@ from Automation.VibraPortal import (
     back_to_orders_list,
     extract_order_items,
     go_home,
+    is_invoiced_status,
     list_order_numbers,
     login,
     open_order_detail,
@@ -30,6 +31,7 @@ QTY_EPSILON_LITERS = 1.0
 SITUATION_TOTAL = "AUTORIZADO TOTAL"
 SITUATION_PARTIAL = "AUTORIZADO PARCIAL"
 SITUATION_BLOCKED = "BLOQUEADO"
+SITUATION_INVOICED = "FATURADO"
 SITUATION_NOT_IN_VIBRA = "NAO ENCONTRADO NA VIBRA"
 
 
@@ -208,6 +210,7 @@ def _compare_order(portal_items: List[dict], vibra_items: List[OrderItem], log_m
                     "productName": portal_item["productName"],
                     "quantityLiters": vibra_item.quantity_liters,
                     "approved": vibra_item.approved,
+                    "invoiced": is_invoiced_status(vibra_item.order_status),
                 }
             )
 
@@ -221,6 +224,8 @@ def _compare_order(portal_items: List[dict], vibra_items: List[OrderItem], log_m
 def _classify(portal_item: dict, vibra_item: Optional[OrderItem]) -> str:
     if vibra_item is None:
         return SITUATION_NOT_IN_VIBRA
+    if is_invoiced_status(vibra_item.order_status):
+        return SITUATION_INVOICED
     if not vibra_item.approved:
         return SITUATION_BLOCKED
     requested_liters = portal_item["requestedQtyM3"] * 1000

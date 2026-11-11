@@ -40,8 +40,10 @@ Ipiranga (`C:\Priortec\Bind-Rpa`): o bot busca os pedidos pendentes em
 `GET /api/rpa/vibra/pendentes` (pedido, unidade, produto, quantidade solicitada), abre só esses
 pedidos, classifica cada item (autorizado total/parcial, bloqueado, não encontrado na Vibra —
 `ProcessModule._classify`) e reporta em `POST /api/rpa/vibra/situacao`
-(`{items: [{distributorOrderNumber, productName, quantityLiters, approved}]}`). O portal grava
-`order_item.distributor_status` = `autorizado` (+ `authorized_qty_m3`) ou `bloqueado`; a unidade
+(`{items: [{distributorOrderNumber, productName, quantityLiters, approved, invoiced}]}`). O portal grava
+`order_item.distributor_status` = `autorizado` (+ `authorized_qty_m3`), `bloqueado` ou `faturado`
+(pedido "Totalmente Faturado" na Vibra; estado final — sai de `/pendentes`, que agora devolve
+também os itens `autorizado` para o bot perceber o faturamento); a unidade
 vem do próprio pedido no portal (`transport_order.station_id`). O casamento do produto é por nome
 na distribuidora (`product_distributor_name` da VIBRA, senão `product.name`). A lista coletada
 também vai para `pedidos_vibra.csv`.
@@ -72,12 +74,18 @@ Trocar empresa     i.trigger-grupo-empresa → diálogo "Outras empresas do grup
                    div.grupo-empresa (div.razao-social span + input[type=radio]),
                    div.footer-grupo-empresa button 'Trocar' / 'Cancelar'
 Meus pedidos       td.mat-column-numeroPedido span.numero-pedido-selecionado  (clicável)
+                   filtro de data: app-meus-pedidos mat-chip ('Cadastrado em X até Y'); o X
+                   (button.mat-mdc-chip-remove) não remove, troca o fim do período para hoje
+                   paginação: mat-paginator mat-select → mat-option '100'
 Detalhe do pedido  app-lista-produtos table.tabela-lista-produtos tbody tr
                    div.title-produto strong (nome), span.codigo-produto (COD)
                    td: [Produto, Base, Prazo, Qtd (L), Qtd pendente (L), Preço, Total]
                    div.nome-imagem-codigo i: 'delete' = aprovado, 'do_disturb_alt' = bloqueado
+Status do pedido   li.detalhes-title 'Status' + li.detalhes-subtitle div.alert (ícone 'info' + texto);
+                   'Totalmente Programado' = em carregamento, sem ícones → produtos aprovados
+                   'Totalmente Faturado' = sem ícones → aprovados + invoiced=true (portal: 'faturado')
 ```
-Não confirmados: paginação da lista "Meus pedidos" e o seletor do Status geral do pedido.
+Não confirmado: navegação para a 2ª página da lista (só a 1ª, com 100 itens, é lida).
 
 ### Stack
 Python 3.11+, `selenium`, `python-dotenv`, `requests`. `PEDIDOS_PATH` (opcional) é um CSV com a coluna

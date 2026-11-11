@@ -4,7 +4,9 @@ Seletores confirmados via inspeção real do DOM (login SSO Keycloak +
 aplicação Angular Material), exceto onde indicado o contrário.
 """
 
+import re
 from dataclasses import dataclass
+from datetime import date
 from typing import Callable, List, Optional
 
 from selenium import webdriver
@@ -50,12 +52,36 @@ COMPANY_SWITCH_TIMEOUT = 60
 # Popup "Informativos" que a home abre por cima de tudo após o login.
 POPUP_CLOSE_XPATH = "//app-informativo-lateral//i[contains(@class,'md-icons')][normalize-space()='close']"
 
+# Lista 'Meus pedidos': abre filtrada pelos últimos 30 dias (chip "Cadastrado em ...")
+# e paginada de 10 em 10 - o bot remove o filtro e passa para 100 por página.
+FILTER_CHIP_SELECTOR = "app-meus-pedidos mat-chip"
+FILTER_CHIP_REMOVE_SELECTOR = "app-meus-pedidos mat-chip button.mat-mdc-chip-remove"
+PAGE_SIZE_SELECT_SELECTOR = "mat-paginator mat-select"
+PAGE_SIZE_VALUE_SELECTOR = "mat-paginator .mat-mdc-select-value-text"
+PAGE_SIZE_OPTION_XPATH = "//mat-option[normalize-space()='{size}']"
+PAGINATOR_RANGE_SELECTOR = "mat-paginator .mat-mdc-paginator-range-label"
+ORDERS_PAGE_SIZE = "100"
+LIST_REFRESH_SECONDS = 15
+
 ORDER_NUMBER_SELECTOR = "td.mat-column-numeroPedido span.numero-pedido-selecionado"
 PRODUCT_ROWS_SELECTOR = "app-lista-produtos table.tabela-lista-produtos tbody tr"
 
 # Ícones Material exibidos à esquerda de cada produto no detalhe do pedido.
 APPROVED_ICON_TEXT = "delete"
 BLOCKED_ICON_TEXT = "do_disturb_alt"
+STATUS_ICON_TEXTS = {APPROVED_ICON_TEXT, BLOCKED_ICON_TEXT}
+ORDER_ICONS_TIMEOUT = 60
+
+# Status geral do pedido no detalhe ('Status' > badge div.alert com ícone 'info' + texto).
+ORDER_STATUS_XPATH = (
+    "//li[contains(@class,'detalhes-title')][normalize-space()='Status']"
+    "/following-sibling::li[contains(@class,'detalhes-subtitle')]//div[contains(@class,'alert')]"
+)
+# Pedido já em carregamento: a Vibra não mostra os ícones de aprovado/bloqueado,
+# mas todos os produtos estão autorizados.
+PROGRAMMED_STATUS_TEXT = "Totalmente Programado"
+# Pedido já faturado: também sem ícones; reportado ao portal como 'faturado'.
+INVOICED_STATUS_TEXT = "Totalmente Faturado"
 
 
 @dataclass
@@ -237,11 +263,8 @@ def _wait_orders_list(driver: webdriver.Chrome, timeout: int) -> None:
 # Lista 'Meus pedidos'
 # --------------------------------------------------------------------------
 def list_order_numbers(driver: webdriver.Chrome) -> List[str]:
-    """Números de pedido visíveis na lista (filtro padrão do portal: últimos 30 dias).
-
-    NOTA: paginação/rolagem infinita da lista ainda não foi validada no DOM
-    real - só os pedidos já renderizados na tela são coletados.
-    """
+    """Números de pedido da página atual da lista (sem filtro de data, 100 por
+    página - ver _prepare_orders_list)."""
     spans = driver.find_elements(By.CSS_SELECTOR, ORDER_NUMBER_SELECTOR)
     order_numbers = [span.text.strip() for span in spans if span.text.strip()]
     # Deduplica mantendo a ordem da tela.
@@ -272,6 +295,24 @@ def open_order_detail(driver: webdriver.Chrome, order_number: str, timeout: int 
         ) from exc
 
 
+def _all_status_icons_loaded(driver: webdriver.Chrome) -> bool:
+    try:
+        product_rows = [
+            row for row in driver.find_elements(By.CSS_SELECTOR, PRODUCT_ROWS_SELECTOR)
+            if row.find_elements(By.CSS_SELECTOR, "div.title-produto")
+        ]
+        return bool(product_rows) and all(_status_icon_texts(row) & STATUS_ICON_TEXTS for row in product_rows)
+    except StaleElementReferenceException:
+        return False
+
+
+def _status_icon_texts(row) -> set:
+    return {
+        (icon.get_attribute("textContent") or "").strip()
+        for icon in row.find_elements(By.CSS_SELECTOR, "div.nome-imagem-codigo i")
+    }
+
+
 def back_to_orders_list(driver: webdriver.Chrome, timeout: int = DEFAULT_TIMEOUT) -> None:
     """O detalhe abre dentro da própria aplicação: voltar no histórico costuma
     bastar; se a lista não reaparecer, refaz o caminho pela home."""
@@ -282,6 +323,9 @@ def back_to_orders_list(driver: webdriver.Chrome, timeout: int = DEFAULT_TIMEOUT
         print("[AVISO] Lista 'Meus pedidos' não reapareceu ao voltar - reabrindo pelo menu.")
         driver.get(HOME_URL)
         open_orders_list(driver, timeout)
+        return
+    # A lista pode voltar com o filtro de data e 10 por página de novo.
+    _prepare_orders_list(driver, timeout)
 
 
 # --------------------------------------------------------------------------
@@ -397,6 +441,97 @@ def open_orders_list(driver: webdriver.Chrome, timeout: int = DEFAULT_TIMEOUT) -
         raise RuntimeError(
             f"Lista 'Pedidos Enviados' não carregou em {timeout}s após o clique no menu. URL atual: {driver.current_url}"
         ) from exc
+    _prepare_orders_list(driver, timeout)
+
+
+def _prepare_orders_list(driver: webdriver.Chrome, timeout: int = DEFAULT_TIMEOUT) -> None:
+    """Atualiza o filtro de data até hoje e mostra 100 pedidos por página -
+    senão o pedido pode ficar fora do período ou numa página seguinte. Só age
+    no que ainda não estiver ajustado."""
+    _update_date_filter_to_today(driver, timeout)
+
+    if _current_page_size(driver) != ORDERS_PAGE_SIZE:
+        _refresh_list_with(driver, lambda: _choose_page_size(driver, timeout), timeout)
+        try:
+            WebDriverWait(driver, timeout).until(lambda d: _current_page_size(d) == ORDERS_PAGE_SIZE)
+        except TimeoutException as exc:
+            raise RuntimeError(
+                f"'Itens por página' não mudou para {ORDERS_PAGE_SIZE} (está em '{_current_page_size(driver)}')."
+            ) from exc
+        print(f"[INFO] Lista com {ORDERS_PAGE_SIZE} itens por página.")
+
+    page_range = _text_or_empty(driver, PAGINATOR_RANGE_SELECTOR)
+    total_pages = re.search(r"de\s+(\d+)", page_range)
+    if total_pages and int(total_pages.group(1)) > 1:
+        print(
+            f"[AVISO] A lista tem mais de uma página mesmo com {ORDERS_PAGE_SIZE} por página ({page_range}) - "
+            "só a primeira é verificada."
+        )
+
+
+def _update_date_filter_to_today(driver: webdriver.Chrome, timeout: int) -> None:
+    """A lista abre com o chip 'Cadastrado em X até Y' terminando numa data
+    antiga. O X do chip não remove o filtro: troca o período para terminar hoje.
+    Por isso só clica se a data final ainda não for hoje (evita clicar de novo
+    ao voltar do detalhe)."""
+    chip_text = _text_or_empty(driver, FILTER_CHIP_SELECTOR)
+    if not chip_text:
+        return
+    end_date = re.search(r"até\s+(\d{2}/\d{2}/\d{4})", chip_text)
+    if not end_date:
+        print(f"[AVISO] Filtro de data da lista com formato inesperado ('{chip_text}') - mantido como está.")
+        return
+    today = date.today().strftime("%d/%m/%Y")
+    if end_date.group(1) == today:
+        return
+
+    remove_button = _wait_clickable(driver, By.CSS_SELECTOR, FILTER_CHIP_REMOVE_SELECTOR, timeout, "X do filtro de data")
+    _refresh_list_with(driver, lambda: _safe_click(driver, remove_button), timeout)
+    try:
+        WebDriverWait(driver, timeout).until(lambda d: _text_or_empty(d, FILTER_CHIP_SELECTOR) != chip_text)
+    except TimeoutException as exc:
+        raise RuntimeError(
+            f"Filtro de data da lista 'Meus pedidos' não mudou após clicar no X (continua '{chip_text}')."
+        ) from exc
+    # O textContent do chip inclui o nome do ícone do X ('cancel').
+    new_text = re.sub(r"\s*cancel\s*$", "", _text_or_empty(driver, FILTER_CHIP_SELECTOR)) or "removido"
+    print(f"[INFO] Filtro de data atualizado: {new_text}.")
+
+
+def _choose_page_size(driver: webdriver.Chrome, timeout: int) -> None:
+    _safe_click(driver, _wait_clickable(driver, By.CSS_SELECTOR, PAGE_SIZE_SELECT_SELECTOR, timeout, "Itens por página"))
+    option = _wait_clickable(
+        driver, By.XPATH, PAGE_SIZE_OPTION_XPATH.format(size=ORDERS_PAGE_SIZE), timeout, f"opção {ORDERS_PAGE_SIZE}"
+    )
+    _safe_click(driver, option)
+
+
+def _refresh_list_with(driver: webdriver.Chrome, action, timeout: int) -> None:
+    """Executa a ação e espera a tabela ser redesenhada - sem isso a leitura
+    pegaria as linhas antigas, de antes do filtro/paginação mudar."""
+    old_rows = driver.find_elements(By.CSS_SELECTOR, ORDER_NUMBER_SELECTOR)
+    action()
+    if old_rows:
+        try:
+            WebDriverWait(driver, LIST_REFRESH_SECONDS).until(EC.staleness_of(old_rows[0]))
+        except TimeoutException:
+            pass  # o Angular pode reaproveitar as linhas; a espera abaixo garante a lista na tela
+    try:
+        _wait_orders_list(driver, timeout)
+    except TimeoutException as exc:
+        raise RuntimeError(f"Lista 'Meus pedidos' não recarregou em {timeout}s.") from exc
+
+
+def _current_page_size(driver: webdriver.Chrome) -> str:
+    return _text_or_empty(driver, PAGE_SIZE_VALUE_SELECTOR)
+
+
+def _text_or_empty(driver: webdriver.Chrome, selector: str) -> str:
+    try:
+        elements = driver.find_elements(By.CSS_SELECTOR, selector)
+        return (elements[0].get_attribute("textContent") or "").strip() if elements else ""
+    except StaleElementReferenceException:
+        return ""
 
 
 def _close_informative_popup(driver: webdriver.Chrome) -> None:
@@ -504,7 +639,19 @@ def extract_order_items(driver: webdriver.Chrome, order_number: str) -> List[Ord
     bloqueio = não aprovado (a linha bloqueada também traz a lixeira,
     desabilitada - por isso o bloqueio é checado primeiro).
     """
-    order_status = _read_order_status(driver)
+    order_status = _read_order_status(driver, order_number)
+    is_programmed = order_status.lower() in (PROGRAMMED_STATUS_TEXT.lower(), INVOICED_STATUS_TEXT.lower())
+    if is_programmed:
+        print(f"[INFO] Pedido {order_number}: {order_status} - produtos considerados aprovados (sem ícones de situação).")
+    else:
+        # Os ícones de situação (aprovado/bloqueado) carregam depois das linhas.
+        try:
+            WebDriverWait(driver, ORDER_ICONS_TIMEOUT, poll_frequency=0.5).until(_all_status_icons_loaded)
+        except TimeoutException:
+            print(
+                f"[AVISO] Pedido {order_number} (status '{order_status}'): ícones de situação não carregaram "
+                f"em {ORDER_ICONS_TIMEOUT}s - lendo assim mesmo."
+            )
 
     items: List[OrderItem] = []
     for row in driver.find_elements(By.CSS_SELECTOR, PRODUCT_ROWS_SELECTOR):
@@ -532,7 +679,7 @@ def extract_order_items(driver: webdriver.Chrome, order_number: str) -> List[Ord
                 base=cells[1].text.strip(),
                 quantity_liters=_parse_liters(cells[3].text),
                 pending_quantity_liters=_parse_liters(cells[4].text),
-                approved=_is_approved(row, order_number, product_name),
+                approved=True if is_programmed else _is_approved(row, order_number, product_name),
             )
         )
 
@@ -542,7 +689,7 @@ def extract_order_items(driver: webdriver.Chrome, order_number: str) -> List[Ord
 
 
 def _is_approved(row, order_number: str, product_name: str) -> bool:
-    icon_texts = [icon.text.strip() for icon in row.find_elements(By.CSS_SELECTOR, "div.nome-imagem-codigo i")]
+    icon_texts = sorted(_status_icon_texts(row))
     if BLOCKED_ICON_TEXT in icon_texts:
         return False
     if APPROVED_ICON_TEXT in icon_texts:
@@ -552,21 +699,31 @@ def _is_approved(row, order_number: str, product_name: str) -> bool:
     )
 
 
-def _read_order_status(driver: webdriver.Chrome) -> str:
-    """Status geral do pedido (ex.: 'Parcialmente Bloqueado').
-
-    NOTA: seletor ainda não confirmado via DOM real - busca o valor abaixo
-    do rótulo 'Status' no cabeçalho do detalhe. Vazio se não encontrar.
-    """
-    candidates = driver.find_elements(
-        By.XPATH,
-        "//*[normalize-space(text())='Status']/following-sibling::*[1]",
-    )
-    if not candidates:
+def _read_order_status(driver: webdriver.Chrome, order_number: str, timeout: int = DEFAULT_TIMEOUT) -> str:
+    """Status geral do pedido (ex.: 'Totalmente Programado', 'Parcialmente Bloqueado')."""
+    try:
+        badge = WebDriverWait(driver, timeout).until(
+            lambda d: _first_with_text(d.find_elements(By.XPATH, ORDER_STATUS_XPATH))
+        )
+    except TimeoutException:
+        print(f"[AVISO] Pedido {order_number}: Status do pedido não encontrado no detalhe em {timeout}s.")
         return ""
-    # O badge traz o texto do ícone Material ('info') numa linha antes do status.
-    lines = [line.strip() for line in candidates[0].text.splitlines() if line.strip()]
-    return lines[-1] if lines else ""
+    # O textContent do badge começa com o nome do ícone Material ('info').
+    icon_text = "".join((i.get_attribute("textContent") or "") for i in badge.find_elements(By.TAG_NAME, "i"))
+    full_text = (badge.get_attribute("textContent") or "").strip()
+    if icon_text and full_text.startswith(icon_text.strip()):
+        full_text = full_text[len(icon_text.strip()):]
+    return " ".join(full_text.split())
+
+
+def _first_with_text(elements):
+    for element in elements:
+        try:
+            if (element.get_attribute("textContent") or "").strip():
+                return element
+        except StaleElementReferenceException:
+            continue
+    return False
 
 
 def _parse_liters(raw: str) -> float:
@@ -576,3 +733,7 @@ def _parse_liters(raw: str) -> float:
         return float(cleaned)
     except ValueError as exc:
         raise RuntimeError(f"Quantidade (L) inválida na tela de detalhe: {raw!r}") from exc
+
+
+def is_invoiced_status(order_status: str) -> bool:
+    return order_status.strip().lower() == INVOICED_STATUS_TEXT.lower()
