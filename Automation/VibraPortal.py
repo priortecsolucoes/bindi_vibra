@@ -33,12 +33,18 @@ MFA_POLL_SECONDS = 5
 
 POPUP_WAIT_SECONDS = 10
 
-# Menu lateral (Angular): recolhido mostra só ícones; os títulos (span.titulo) só
-# ficam visíveis com o menu expandido.
-MENU_SELECTOR = "app-menu-item"
+# Menu lateral (Angular), recolhido mostra só ícones. Há dois layouts:
+# - antigo: app-menu-item, expande com o mouse em cima (hover);
+# - "NOVA HOME": home-acesso-rapido-lateral, expande clicando em
+#   mat-icon.icone-expandir (div.menu-lateral ganha a classe 'expandido').
+# MENU_SELECTOR também serve de sinal de "home carregada" após o login.
+MENU_SELECTOR = "app-menu-item, home-acesso-rapido-lateral"
+LEGACY_MENU_ICON_SELECTOR = "app-menu-item div.main-item"
+MENU_EXPAND_BUTTON_SELECTOR = "home-acesso-rapido-lateral mat-icon.icone-expandir"
 MENU_ITEM_XPATH = (
     "//app-menu-item//div[contains(@class,'main-item')]"
     "[.//span[contains(@class,'titulo')][normalize-space()='{title}']]"
+    " | //home-acesso-rapido-lateral//*[normalize-space(text())='{title}']"
 )
 # Empresa (posto) ativa no cabeçalho e diálogo "Outras empresas do grupo": um
 # mesmo login enxerga vários postos, mas 'Meus pedidos' só lista os do posto ativo.
@@ -555,17 +561,30 @@ def _close_informative_popup(driver: webdriver.Chrome) -> None:
 
 
 def _expand_side_menu(driver: webdriver.Chrome, first_title: str, timeout: int) -> None:
-    """Põe o mouse sobre o menu lateral recolhido para ele expandir e mostrar os títulos."""
+    """Expande o menu lateral recolhido até o título `first_title` ficar visível:
+    clica no botão de expandir (layout novo) ou põe o mouse em cima (layout antigo)."""
     title_xpath = MENU_ITEM_XPATH.format(title=first_title)
     if _wait_visible(driver, title_xpath, 0):
         return
     try:
-        icon = WebDriverWait(driver, timeout).until(
-            EC.visibility_of_element_located((By.CSS_SELECTOR, f"{MENU_SELECTOR} div.main-item"))
+        WebDriverWait(driver, timeout).until(
+            lambda d: _first_visible_css(d, MENU_EXPAND_BUTTON_SELECTOR) or _first_visible_css(d, LEGACY_MENU_ICON_SELECTOR)
         )
     except TimeoutException as exc:
         raise RuntimeError(f"Menu lateral não apareceu em {timeout}s. URL atual: {driver.current_url}") from exc
 
+    expand_button = _first_visible_css(driver, MENU_EXPAND_BUTTON_SELECTOR)
+    if expand_button:
+        _safe_click(driver, expand_button)
+        if _wait_visible(driver, title_xpath, 5):
+            return
+        # Clique nativo pode cair no <svg> interno sem disparar o handler do Angular.
+        driver.execute_script("arguments[0].click();", expand_button)
+        if _wait_visible(driver, title_xpath, 5):
+            return
+        raise RuntimeError(f"Menu lateral não expandiu após clicar no botão: título '{first_title}' não apareceu.")
+
+    icon = _first_visible_css(driver, LEGACY_MENU_ICON_SELECTOR)
     ActionChains(driver).move_to_element(icon).perform()
     if _wait_visible(driver, title_xpath, 5):
         return
@@ -580,6 +599,16 @@ def _expand_side_menu(driver: webdriver.Chrome, first_title: str, timeout: int) 
     )
     if not _wait_visible(driver, title_xpath, 5):
         raise RuntimeError(f"Menu lateral não expandiu: título '{first_title}' não apareceu.")
+
+
+def _first_visible_css(driver: webdriver.Chrome, selector: str):
+    for element in driver.find_elements(By.CSS_SELECTOR, selector):
+        try:
+            if element.is_displayed():
+                return element
+        except StaleElementReferenceException:
+            continue
+    return False
 
 
 def _open_menu_group(driver: webdriver.Chrome, title: str, next_title: str, timeout: int) -> None:

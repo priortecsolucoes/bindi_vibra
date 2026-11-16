@@ -67,7 +67,9 @@ separados por unidade, pra reaproveitar a sessão do SSO sem misturar logins.
 Login (SSO)        #username, #password, #loginBt
 Home               cn.vibraenergia.com.br/home/#/ (a lista não abre mais por URL direta)
 Popup Informativos app-informativo-lateral i.md-icons 'close' (fechar antes de usar o menu)
-Menu lateral       app-menu-item div.main-item span.titulo — expande com hover;
+Menu lateral       dois layouts: antigo app-menu-item div.main-item span.titulo (expande com
+                   hover) e "NOVA HOME" home-acesso-rapido-lateral (expande clicando em
+                   mat-icon.icone-expandir; div.menu-lateral ganha 'expandido');
                    Pedidos > Consultar > Pedidos Enviados
 Empresa ativa      div.dados-cliente span.nome (cabeçalho; nome completo no textContent)
 Trocar empresa     i.trigger-grupo-empresa → diálogo "Outras empresas do grupo":
