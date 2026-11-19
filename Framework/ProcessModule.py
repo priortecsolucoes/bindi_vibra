@@ -249,5 +249,11 @@ def _report_situations(situations: List[dict], config: BotConfig) -> None:
                 f"[AVISO] {entry.get('distributorOrderNumber')}/{entry.get('productName')}: "
                 "não encontrado no Portal Bindi Log."
             )
+        for entry in result.get("failed", []):
+            order_label = f" (pedido {entry['orderNumber']})" if entry.get("orderNumber") else ""
+            print(
+                f"[ERRO] {entry.get('distributorOrderNumber')}/{entry.get('productName')}{order_label} "
+                f"não foi atualizado no Portal Bindi Log: {entry.get('reason')}"
+            )
     except Exception as exc:  # noqa: BLE001
         print(f"[ERRO] Falha ao reportar a situação dos itens ao Portal Bindi Log: {exc}")

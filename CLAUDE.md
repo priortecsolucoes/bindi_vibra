@@ -43,7 +43,9 @@ pedidos, classifica cada item (autorizado total/parcial, bloqueado, não encontr
 (`{items: [{distributorOrderNumber, productName, quantityLiters, approved, invoiced}]}`). O portal grava
 `order_item.distributor_status` = `autorizado` (+ `authorized_qty_m3`), `bloqueado` ou `faturado`
 (pedido "Totalmente Faturado" na Vibra; estado final — sai de `/pendentes`, que agora devolve
-também os itens `autorizado` para o bot perceber o faturamento); a unidade
+também os itens `autorizado` para o bot perceber o faturamento). A resposta traz
+`{updated, notFound, failed}`: item recusado (ex.: quantidade na Vibra maior que a solicitada, regra
+`ck_item_qty_auth`) vai em `failed`, não impede os demais e aparece como `[ERRO]` no log; a unidade
 vem do próprio pedido no portal (`transport_order.station_id`). O casamento do produto é por nome
 na distribuidora (`product_distributor_name` da VIBRA, senão `product.name`). A lista coletada
 também vai para `pedidos_vibra.csv`.
@@ -172,8 +174,8 @@ Railway, via `Dockerfile` (Python 3.11-slim + Google Chrome) + `railway.json`
 (`cronSchedule: "*/30 * * * *"`, `restartPolicyType: "NEVER"`). Variáveis de ambiente no
 dashboard do Railway (nunca no Dockerfile): `PORTAL_API_URL`, `PORTAL_API_TOKEN`,
 `VIBRA_TOKEN_API_URL`, `VIBRA_TOKEN_API_TOKEN` (o login na
-Vibra vem do cadastro de Unidades). `CHROME_HEADLESS=1` e `SCHEDULE_INTERVAL_MINUTES=0`
-já vêm fixos no Dockerfile (a Akamai da Vibra dá "Access Denied" para `HeadlessChrome` no
-User-Agent; o `DriverFactory` troca por `Chrome` em headless). Fora do container, `main.py` repete a execução a cada
-`SCHEDULE_INTERVAL_MINUTES` (padrão 5; 0 = roda uma vez). No container o perfil/cookies não persistem entre execuções (sem
+Vibra vem do cadastro de Unidades). `CHROME_HEADLESS=1`
+já vem fixo no Dockerfile (a Akamai da Vibra dá "Access Denied" para `HeadlessChrome` no
+User-Agent; o `DriverFactory` troca por `Chrome` em headless). `main.py` roda uma vez e encerra;
+quem repete a execução é o cron do Railway. No container o perfil/cookies não persistem entre execuções (sem
 volume), então cada execução pede um código 2FA novo por unidade.

@@ -40,17 +40,15 @@ def fetch_pending_items(base_url: str, token: str, days_ahead: int) -> List[dict
 
 def report_item_situations(base_url: str, token: str, items: List[dict]) -> dict:
     """POST /api/rpa/vibra/situacao - reporta a situação de cada produto
-    (distributorOrderNumber, productName, quantityLiters, approved).
-    Devolve {"updated": N, "notFound": [...]}."""
+    (distributorOrderNumber, productName, quantityLiters, approved, invoiced).
+    Devolve {"updated": N, "notFound": [...], "failed": [...]}."""
     url = f"{base_url.rstrip('/')}/api/rpa/vibra/situacao"
     try:
         response = requests.post(url, headers=_headers(token), json={"items": items}, timeout=REQUEST_TIMEOUT_SECONDS)
     except requests.RequestException as exc:
         raise RPAFrameworkException(f"Falha ao conectar no Portal Bindi Log ({url}): {exc}") from exc
 
-    if response.status_code not in (200, 400):
-        # 400 pode vir com sucesso parcial (ver rota) - só HTTP fora desse
-        # conjunto é falha de fato (ex.: 401 token errado, 500 servidor).
+    if response.status_code != 200:
         raise RPAFrameworkException(
             f"Portal Bindi Log recusou o relato de situação (HTTP {response.status_code}): {response.text[:300]}"
         )
